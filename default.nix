@@ -18,7 +18,7 @@ pkgs.rustPlatform.buildRustPackage {
     pkgs.gst_all_1.gst-plugins-ugly
     pkgs.gst_all_1.gst-libav
   ];
-  pname = "clips-workspace";
+  pname = "rs-clips";
   version = "1.0";
   cargoLock.lockFile = ./Cargo.lock;
   src = pkgs.lib.cleanSource ./.;
