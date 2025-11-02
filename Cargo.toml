@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "app",
+    "overlay"
+]
+resolver = "2"
+
