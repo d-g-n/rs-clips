@@ -1,8 +1,7 @@
 {
   pkgs ? import <nixpkgs> { },
-  lib,
 }:
-pkgs.rustPlatform.buildRustPackage rec {
+pkgs.rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     pkgs.pkg-config
     pkgs.wrapGAppsHook3
@@ -23,5 +22,4 @@ pkgs.rustPlatform.buildRustPackage rec {
   version = "1.0";
   cargoLock.lockFile = ./Cargo.lock;
   src = pkgs.lib.cleanSource ./.;
-  cargoHash = lib.fakeHash;
 }
