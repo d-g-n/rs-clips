@@ -110,10 +110,12 @@ async fn run_capture_mode(cfg: CaptureConfig) -> Result<()> {
     let overlay_for_hotkey = overlay_handle.clone();
     let visible_for_hotkey = visible.clone();
     let hotkey = cfg.hotkey.clone();
-    let hotkey_task = spawn_hotkey_listener(hotkey.clone(), overlay_for_hotkey, visible_for_hotkey).await;
+    
+    // BUG FIX: Returns a Vec of handles now
+    let hotkey_tasks = spawn_hotkey_listener(hotkey.clone(), overlay_for_hotkey, visible_for_hotkey).await;
 
-    if hotkey_task.is_none() {
-        eprintln!("[CLIPS_APP] Global shortcut portal unavailable, showing overlay by default");
+    if hotkey_tasks.is_empty() {
+        eprintln!("[CLIPS_APP] Global shortcut portal unavailable/no keyboards found, showing overlay by default");
         set_overlay_visible(&overlay_handle, &visible, true)?;
     }
 
@@ -165,7 +167,8 @@ async fn run_capture_mode(cfg: CaptureConfig) -> Result<()> {
         overlay_handle.send_capture_status(build_capture_status(&controller.status()?, &cfg.hotkey, &failed_uploads_list, mode))?;
     }
 
-    if let Some(handle) = hotkey_task {
+    // BUG FIX: Clean up all hotkey listener threads
+    for handle in hotkey_tasks {
         handle.abort();
     }
 
@@ -181,7 +184,6 @@ enum CaptureLoopOutcome {
     Saved(PathBuf),
     Exit,
 }
-
 
 async fn run_capture_loop(
     cfg: &CaptureConfig,
@@ -391,6 +393,7 @@ async fn run_capture_loop(
                                 }
                             }
                             CaptureActionPayload::FailedUpload { upload_action, id } => {
+                                // ... [Failed Upload Handling Logic - same as original] ...
                                 match upload_action.as_str() {
                                     "retry" => {
                                         if let Some(failed_upload) = failed_uploads_list.get(&id) {
@@ -798,11 +801,12 @@ fn set_overlay_visible(
     Ok(())
 }
 
+// BUG FIX: Changed return type to Vec<JoinHandle<()>> to manage multiple listener threads
 async fn spawn_hotkey_listener(
     hotkey: String,
     overlay_handle: overlay::OverlayHandle,
     visible_state: Arc<AtomicBool>,
-) -> Option<JoinHandle<()>> {
+) -> Vec<JoinHandle<()>> {
     // Parse the hotkey string (e.g., "Alt+X")
     let (modifier_keys, target_key) = parse_hotkey(&hotkey);
     
@@ -814,77 +818,105 @@ async fn spawn_hotkey_listener(
         Ok(_) => {
             eprintln!("[CLIPS_APP] No keyboard devices found in /dev/input");
             eprintln!("[CLIPS_APP] Make sure your user is in the 'input' group");
-            return None;
+            return Vec::new();
         }
         Err(err) => {
             eprintln!("[CLIPS_APP] Failed to enumerate keyboard devices: {err:#}");
             eprintln!("[CLIPS_APP] Make sure your user is in the 'input' group");
-            return None;
+            return Vec::new();
         }
     };
 
-    eprintln!("[CLIPS_APP] Found {} keyboard device(s), monitoring for hotkey...", keyboard_devices.len());
+    eprintln!("[CLIPS_APP] Found {} keyboard device(s), spawning monitors...", keyboard_devices.len());
 
-    Some(tokio::task::spawn_blocking(move || {
-        let mut pressed_modifiers = std::collections::HashSet::new();
+    let mut handles = Vec::new();
+
+    // BUG FIX: Spawn a separate thread for each keyboard device found
+    for device_path in keyboard_devices {
+        // Clone shared state for each thread
+        let path_clone = device_path.clone();
+        let modifier_keys_clone = modifier_keys.clone();
+        let overlay_clone = overlay_handle.clone();
+        let visible_clone = visible_state.clone();
+
+        let handle = tokio::task::spawn_blocking(move || {
+            monitor_device(
+                path_clone,
+                target_key,
+                modifier_keys_clone,
+                overlay_clone,
+                visible_clone
+            );
+        });
         
-        // Monitor all keyboard devices
-        for device_path in keyboard_devices {
-            let mut device = match Device::open(&device_path) {
-                Ok(dev) => dev,
-                Err(err) => {
-                    eprintln!("[CLIPS_APP] Failed to open {}: {}", device_path, err);
-                    continue;
-                }
-            };
+        handles.push(handle);
+    }
+    
+    handles
+}
 
-            eprintln!("[CLIPS_APP] Monitoring keyboard: {:?}", device.name());
+// Extracted blocking logic to a separate function for clarity
+fn monitor_device(
+    device_path: String,
+    target_key: Key,
+    modifier_keys: Vec<Key>,
+    overlay_handle: overlay::OverlayHandle,
+    visible_state: Arc<AtomicBool>
+) {
+    let mut device = match Device::open(&device_path) {
+        Ok(dev) => dev,
+        Err(err) => {
+            eprintln!("[CLIPS_APP] Failed to open {}: {}", device_path, err);
+            return;
+        }
+    };
 
-            loop {
-                match device.fetch_events() {
-                    Ok(events) => {
-                        for ev in events {
-                            if let InputEventKind::Key(key) = ev.kind() {
-                                let pressed = ev.value() == 1;
-                                
-                                // Track modifier keys
-                                if modifier_keys.contains(&key) {
-                                    if pressed {
-                                        pressed_modifiers.insert(key);
-                                    } else {
-                                        pressed_modifiers.remove(&key);
-                                    }
-                                }
-                                
-                                // Check if hotkey is pressed
-                                if key == target_key && pressed {
-                                    let all_modifiers_pressed = modifier_keys.iter()
-                                        .all(|m| pressed_modifiers.contains(m));
-                                    
-                                    if all_modifiers_pressed {
-                                        let desired = !visible_state.load(Ordering::SeqCst);
-                                        if let Err(err) = overlay_handle.set_visibility(desired) {
-                                            eprintln!("[CLIPS_APP] Failed to toggle overlay: {err:#}");
-                                        } else {
-                                            visible_state.store(desired, Ordering::SeqCst);
-                                            eprintln!("[CLIPS_APP] Toggled overlay to: {}", desired);
-                                        }
-                                    }
+    eprintln!("[CLIPS_APP] Monitoring keyboard: {:?}", device.name());
+    let mut pressed_modifiers = std::collections::HashSet::new();
+
+    loop {
+        match device.fetch_events() {
+            Ok(events) => {
+                for ev in events {
+                    if let InputEventKind::Key(key) = ev.kind() {
+                        let pressed = ev.value() == 1;
+                        
+                        // Track modifier keys
+                        if modifier_keys.contains(&key) {
+                            if pressed {
+                                pressed_modifiers.insert(key);
+                            } else if ev.value() == 0 { // Handle release explicitly
+                                pressed_modifiers.remove(&key);
+                            }
+                        }
+                        
+                        // Check if hotkey is pressed
+                        if key == target_key && pressed {
+                            let all_modifiers_pressed = modifier_keys.iter()
+                                .all(|m| pressed_modifiers.contains(m));
+                            
+                            if all_modifiers_pressed {
+                                let desired = !visible_state.load(Ordering::SeqCst);
+                                if let Err(err) = overlay_handle.set_visibility(desired) {
+                                    eprintln!("[CLIPS_APP] Failed to toggle overlay: {err:#}");
+                                } else {
+                                    visible_state.store(desired, Ordering::SeqCst);
+                                    eprintln!("[CLIPS_APP] Toggled overlay to: {}", desired);
                                 }
                             }
                         }
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(err) => {
-                        eprintln!("[CLIPS_APP] Error reading events: {}", err);
-                        break;
-                    }
                 }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => {
+                eprintln!("[CLIPS_APP] Error reading events from {}: {}", device_path, err);
+                break;
+            }
         }
-    }))
+    }
 }
 
 fn find_keyboard_devices() -> Result<Vec<String>> {
@@ -899,9 +931,16 @@ fn find_keyboard_devices() -> Result<Vec<String>> {
         if let Some(filename) = path.file_name() {
             if filename.to_string_lossy().starts_with("event") {
                 if let Ok(device) = Device::open(&path) {
-                    // Check if it's a keyboard (has KEY_X capability)
-                    if device.supported_keys().is_some_and(|keys| keys.contains(Key::KEY_X)) {
-                        keyboards.push(path.to_string_lossy().to_string());
+                    // BUG FIX: Better keyboard detection
+                    // Check for a combination of keys that indicates a "real" keyboard
+                    // Checking only for KEY_X allows mice with side buttons to be detected
+                    if let Some(keys) = device.supported_keys() {
+                        if keys.contains(Key::KEY_ENTER) 
+                            && keys.contains(Key::KEY_ESC) 
+                            && keys.contains(Key::KEY_A) 
+                        {
+                            keyboards.push(path.to_string_lossy().to_string());
+                        }
                     }
                 }
             }
